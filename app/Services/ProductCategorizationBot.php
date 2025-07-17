@@ -34,88 +34,240 @@ class ProductCategorizationBot
     /**
      * یافتن بهترین دسته‌بندی همراه با امتیاز
      */
-    public function findBestCategoryWithScore(Product $product): ?array
-    {
-        try {
-            // بررسی وجود ایندکس
-            if (!$this->indexExists()) {
-                Log::warning('Index does not exist. Please run setup first.');
-                return null;
-            }
+ 
+public function findBestCategoryWithScore(Product $product): ?array
+{
+    try {
+        if (!$this->indexExists()) {
+            Log::warning('Index does not exist. Please run setup first.');
+            return null;
+        }
 
-            $searchText = $this->prepareSearchText($product);
+        $searchText = $this->prepareSearchText($product);
 
-            if (empty(trim($searchText))) {
-                Log::warning("Empty search text for product {$product->id}");
-                return null;
-            }
+        if (empty(trim($searchText))) {
+            Log::warning("Empty search text for product {$product->id}");
+            return null;
+        }
 
-            $searchParams = [
-                'index' => $this->index,
-                'body' => [
-                    'query' => [
-                        'bool' => [
-                            'should' => [
-                                [
-                                    'match' => [
-                                        'category_name' => [
-                                            'query' => $searchText,
-                                            'boost' => 3.0
-                                        ]
-                                    ]
-                                ],
-                                [
-                                    'match' => [
-                                        'category_keywords' => [
-                                            'query' => $searchText,
-                                            'boost' => 2.0
-                                        ]
-                                    ]
-                                ],
-                                [
-                                    'match' => [
-                                        'category_description' => [
-                                            'query' => $searchText,
-                                            'boost' => 1.0
-                                        ]
+        // استخراج کلمات کلیدی از عنوان محصول
+        $titleKeywords = $this->extractKeywords($product->title ?? '');
+        $productKeywords = $this->extractKeywords($product->keyword ?? '');
+
+        $searchParams = [
+            'index' => $this->index,
+            'body' => [
+                'query' => [
+                    'bool' => [
+                        'should' => [
+                            // تطابق دقیق با نام دسته‌بندی
+                            [
+                                'match' => [
+                                    'category_name' => [
+                                        'query' => $searchText,
+                                        'boost' => 5.0,
+                                        'operator' => 'and'
                                     ]
                                 ]
                             ],
-                            'minimum_should_match' => 1
+                            // تطابق فازی با نام دسته‌بندی
+                            [
+                                'match' => [
+                                    'category_name' => [
+                                        'query' => $searchText,
+                                        'boost' => 3.0,
+                                        'fuzziness' => 'AUTO'
+                                    ]
+                                ]
+                            ],
+                            // تطابق با کلمات کلیدی دسته‌بندی
+                            [
+                                'match' => [
+                                    'category_keywords' => [
+                                        'query' => $searchText,
+                                        'boost' => 4.0
+                                    ]
+                                ]
+                            ],
+                            // تطابق phrase برای عبارات
+                            [
+                                'match_phrase' => [
+                                    'category_name' => [
+                                        'query' => implode(' ', array_slice($titleKeywords, 0, 3)),
+                                        'boost' => 6.0
+                                    ]
+                                ]
+                            ],
+                            // تطابق با توضیحات
+                            [
+                                'match' => [
+                                    'category_description' => [
+                                        'query' => $searchText,
+                                        'boost' => 1.5
+                                    ]
+                                ]
+                            ],
+                            // تطابق دقیق کلمات کلیدی محصول
+                            [
+                                'terms' => [
+                                    'category_keywords' => $productKeywords,
+                                    'boost' => 4.5
+                                ]
+                            ]
+                        ],
+                        'minimum_should_match' => 1,
+                        // فیلتر کردن نتایج ضعیف
+                        'filter' => [
+                            'script' => [
+                                'script' => [
+                                    'source' => "_score > 100" // حداقل امتیاز
+                                ]
+                            ]
                         ]
-                    ],
-                    'size' => 5, // گرفتن چند نتیجه برتر
-                    'min_score' => 0.3 // حداقل امتیاز برای نتایج (کاهش یافته)
-                ]
-            ];
+                    ]
+                ],
+                'size' => 10,
+                'min_score' => 150, // افزایش حداقل امتیاز
+                '_source' => ['category_id', 'category_name', 'category_keywords']
+            ]
+        ];
 
-            $response = $this->client->search($searchParams);
+        $response = $this->client->search($searchParams);
 
-            if (empty($response['hits']['hits'])) {
-                Log::info("No matching category found for product {$product->id}");
-                return null;
-            }
-
-            $bestMatch = $response['hits']['hits'][0];
-            $categoryId = $bestMatch['_source']['category_id'];
-            $score = $bestMatch['_score'];
-
-            $category = Category::find($categoryId);
-
-            if (!$category) {
-                Log::warning("Category {$categoryId} not found in database");
-                return null;
-            }
-
-            return [
-                'category' => $category,
-                'score' => $score
-            ];
-        } catch (Exception $e) {
-            Log::error('Error in findBestCategoryWithScore: ' . $e->getMessage());
+        if (empty($response['hits']['hits'])) {
+            Log::info("No matching category found for product {$product->id}");
             return null;
         }
+
+        // انتخاب بهترین نتیجه با الگوریتم پیشرفته‌تر
+        $bestMatch = $this->selectBestMatchImproved($response['hits']['hits'], $searchText, $titleKeywords);
+
+        if (!$bestMatch) {
+            return null;
+        }
+
+        $categoryId = $bestMatch['_source']['category_id'];
+        $score = $bestMatch['_score'];
+
+        $category = Category::find($categoryId);
+
+        if (!$category) {
+            Log::warning("Category {$categoryId} not found in database");
+            return null;
+        }
+
+        return [
+            'category' => $category,
+            'score' => $score
+        ];
+    } catch (Exception $e) {
+        Log::error('Error in findBestCategoryWithScore: ' . $e->getMessage());
+        return null;
     }
+}
+
+private function selectBestMatchImproved(array $hits, string $searchText, array $titleKeywords): ?array
+{
+    if (empty($hits)) {
+        return null;
+    }
+
+    $bestMatch = null;
+    $bestScore = 0;
+
+    foreach ($hits as $hit) {
+        $score = $hit['_score'];
+        $categoryName = $hit['_source']['category_name'];
+        $categoryKeywords = $hit['_source']['category_keywords'] ?? '';
+        
+        // بررسی تطابق مستقیم
+        $directMatch = $this->calculateDirectMatch($searchText, $categoryName, $titleKeywords);
+        
+        // بررسی تطابق کلمات کلیدی
+        $keywordMatch = $this->calculateKeywordMatch($titleKeywords, $categoryKeywords);
+        
+        // محاسبه امتیاز نهایی
+        $finalScore = $score + ($directMatch * 100) + ($keywordMatch * 50);
+        
+        if ($finalScore > $bestScore) {
+            $bestScore = $finalScore;
+            $bestMatch = $hit;
+            $bestMatch['_score'] = $finalScore; // بروزرسانی امتیاز
+        }
+    }
+
+    return $bestMatch;
+}
+
+// تابع محاسبه تطابق مستقیم
+private function calculateDirectMatch(string $searchText, string $categoryName, array $titleKeywords): float
+{
+    $matchScore = 0;
+    
+    // تطابق دقیق نام دسته‌بندی
+    if (stripos($searchText, $categoryName) !== false || stripos($categoryName, $searchText) !== false) {
+        $matchScore += 3;
+    }
+    
+    // تطابق کلمات کلیدی عنوان
+    foreach ($titleKeywords as $keyword) {
+        if (stripos($categoryName, $keyword) !== false) {
+            $matchScore += 1;
+        }
+    }
+    
+    // تطابق طول نام (دسته‌بندی‌های مشابه در طول ترجیح دارند)
+    $lengthSimilarity = 1 - abs(mb_strlen($searchText) - mb_strlen($categoryName)) / max(mb_strlen($searchText), mb_strlen($categoryName));
+    $matchScore += $lengthSimilarity;
+    
+    return $matchScore;
+}
+
+// تابع محاسبه تطابق کلمات کلیدی
+private function calculateKeywordMatch(array $titleKeywords, string $categoryKeywords): float
+{
+    if (empty($categoryKeywords)) return 0;
+    
+    $categoryKeywordArray = explode(' ', $categoryKeywords);
+    $matchCount = 0;
+    
+    foreach ($titleKeywords as $titleKeyword) {
+        foreach ($categoryKeywordArray as $catKeyword) {
+            if (stripos($catKeyword, $titleKeyword) !== false || stripos($titleKeyword, $catKeyword) !== false) {
+                $matchCount++;
+                break;
+            }
+        }
+    }
+    
+    return $matchCount / max(count($titleKeywords), 1);
+}
+// اضافه کردن تابع استخراج کلمات کلیدی
+private function extractKeywords(string $text): array
+{
+    if (empty($text)) return [];
+    
+    // پاک کردن کاراکترهای اضافی
+    $text = strip_tags($text);
+    $text = preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $text);
+    $text = preg_replace('/\s+/', ' ', $text);
+    
+    // تقسیم به کلمات
+    $words = explode(' ', trim($text));
+    
+    // فیلتر کردن کلمات کوتاه و عام
+    $stopWords = ['و', 'در', 'با', 'به', 'از', 'که', 'این', 'آن', 'را', 'تا', 'برای'];
+    $keywords = [];
+    
+    foreach ($words as $word) {
+        $word = trim($word);
+        if (mb_strlen($word) > 2 && !in_array($word, $stopWords)) {
+            $keywords[] = $word;
+        }
+    }
+    
+    return array_slice($keywords, 0, 10); // حداکثر 10 کلمه
+}
 
     /**
      * انتخاب بهترین نتیجه از میان نتایج موجود
@@ -164,21 +316,61 @@ class ProductCategorizationBot
      * آماده‌سازی متن جستجو از محصول
      */
     private function prepareSearchText(Product $product): string
-    {
-        $searchParts = [
-            $product->title ?? '',
-            $product->titleSeo ?? '',
-            $product->keyword ?? '',
-            $product->body ?? ''
-        ];
-
-        // پاک کردن تگ‌های HTML و کاراکترهای اضافی
-        $searchText = implode(' ', array_filter($searchParts));
-        $searchText = strip_tags($searchText);
-        $searchText = preg_replace('/\s+/', ' ', $searchText);
-        
-        return trim($searchText);
+{
+    $searchParts = [];
+    
+    // اولویت‌بندی اجزای مختلف
+    if ($product->title) {
+        $searchParts[] = $product->title . ' ' . $product->title; // تکرار عنوان برای تاکید
     }
+    
+    if ($product->keyword) {
+        $searchParts[] = $product->keyword . ' ' . $product->keyword; // تکرار کلمات کلیدی
+    }
+    
+    if ($product->titleSeo) {
+        $searchParts[] = $product->titleSeo;
+    }
+    
+    // استخراج کلمات مهم از body
+    if ($product->body) {
+        $bodyText = strip_tags($product->body);
+        $bodyWords = explode(' ', $bodyText);
+        $importantWords = array_slice($bodyWords, 0, 20); // فقط 20 کلمه اول
+        $searchParts[] = implode(' ', $importantWords);
+    }
+    
+    // ترکیب تمام قسمت‌ها
+    $searchText = implode(' ', array_filter($searchParts));
+    
+    // پاک‌سازی و نرمال‌سازی
+    $searchText = $this->normalizeText($searchText);
+    
+    return trim($searchText);
+}
+
+// تابع نرمال‌سازی متن
+private function normalizeText(string $text): string
+{
+    // پاک کردن HTML tags
+    $text = strip_tags($text);
+    
+    // پاک کردن کاراکترهای خاص
+    $text = preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $text);
+    
+    // جایگزینی چند space با یک space
+    $text = preg_replace('/\s+/', ' ', $text);
+    
+    // تبدیل اعداد انگلیسی به فارسی
+    $englishNumbers = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+    $persianNumbers = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹'];
+    $text = str_replace($englishNumbers, $persianNumbers, $text);
+    
+    // نرمال‌سازی کاراکترهای فارسی
+    $text = str_replace(['ك', 'ي'], ['ک', 'ی'], $text);
+    
+    return $text;
+}
 
     /**
      * اختصاص دسته‌بندی به محصول
@@ -220,102 +412,216 @@ class ProductCategorizationBot
     /**
      * ایجاد ایندکس برای دسته‌بندی محصولات
      */
-    public function createIndex(): void
-    {
-        try {
-            $params = [
-                'index' => $this->index,
-                'body' => [
-                    'settings' => [
-                        'number_of_shards' => 1,
-                        'number_of_replicas' => 0,
-                        'analysis' => [
-                            'analyzer' => [
-                                'persian_analyzer' => [
-                                    'type' => 'custom',
-                                    'tokenizer' => 'standard',
-                                    'filter' => ['lowercase', 'persian_normalization']
-                                ]
+  
+public function createIndex(): void
+{
+    try {
+        $params = [
+            'index' => $this->index,
+            'body' => [
+                'settings' => [
+                    'number_of_shards' => 1,
+                    'number_of_replicas' => 0,
+                    'analysis' => [
+                        'filter' => [
+                            'persian_stop' => [
+                                'type' => 'stop',
+                                'stopwords' => ['و', 'در', 'با', 'به', 'از', 'که', 'این', 'آن', 'را', 'تا', 'برای', 'یا', 'اما', 'اگر']
+                            ],
+                            'persian_stemmer' => [
+                                'type' => 'stemmer',
+                                'language' => 'persian'
                             ]
-                        ]
-                    ],
-                    'mappings' => [
-                        'properties' => [
-                            'category_id' => ['type' => 'integer'],
-                            'category_name' => [
-                                'type' => 'text',
-                                'analyzer' => 'persian_analyzer',
-                                'fields' => [
-                                    'keyword' => [
-                                        'type' => 'keyword'
-                                    ]
+                        ],
+                        'analyzer' => [
+                            'persian_analyzer' => [
+                                'type' => 'custom',
+                                'tokenizer' => 'standard',
+                                'filter' => [
+                                    'lowercase',
+                                    'persian_normalization',
+                                    'persian_stop',
+                                    'persian_stemmer'
                                 ]
                             ],
-                            'category_keywords' => [
-                                'type' => 'text',
-                                'analyzer' => 'persian_analyzer'
-                            ],
-                            'category_description' => [
-                                'type' => 'text',
-                                'analyzer' => 'persian_analyzer'
+                            'persian_search_analyzer' => [
+                                'type' => 'custom',
+                                'tokenizer' => 'keyword',
+                                'filter' => [
+                                    'lowercase',
+                                    'persian_normalization'
+                                ]
                             ]
                         ]
                     ]
+                ],
+                'mappings' => [
+                    'properties' => [
+                        'category_id' => ['type' => 'integer'],
+                        'category_name' => [
+                            'type' => 'text',
+                            'analyzer' => 'persian_analyzer',
+                            'search_analyzer' => 'persian_search_analyzer',
+                            'fields' => [
+                                'keyword' => [
+                                    'type' => 'keyword'
+                                ],
+                                'ngram' => [
+                                    'type' => 'text',
+                                    'analyzer' => 'persian_analyzer',
+                                    'search_analyzer' => 'persian_search_analyzer'
+                                ]
+                            ]
+                        ],
+                        'category_keywords' => [
+                            'type' => 'text',
+                            'analyzer' => 'persian_analyzer',
+                            'search_analyzer' => 'persian_search_analyzer',
+                            'fields' => [
+                                'keyword' => [
+                                    'type' => 'keyword'
+                                ]
+                            ]
+                        ],
+                        'category_description' => [
+                            'type' => 'text',
+                            'analyzer' => 'persian_analyzer'
+                        ]
+                    ]
                 ]
-            ];
+            ]
+        ];
 
-            // بررسی وجود index و حذف در صورت وجود
-            if ($this->indexExists()) {
-                $this->client->indices()->delete(['index' => $this->index]);
-                Log::info('Existing index deleted');
-            }
-
-            $this->client->indices()->create($params);
-            Log::info('Elasticsearch index created successfully');
-        } catch (Exception $e) {
-            Log::error('Error creating Elasticsearch index: ' . $e->getMessage());
-            throw $e;
+        // بررسی وجود index و حذف در صورت وجود
+        if ($this->indexExists()) {
+            $this->client->indices()->delete(['index' => $this->index]);
+            Log::info('Existing index deleted');
         }
-    }
 
+        $this->client->indices()->create($params);
+        Log::info('Elasticsearch index created successfully');
+    } catch (Exception $e) {
+        Log::error('Error creating Elasticsearch index: ' . $e->getMessage());
+        throw $e;
+    }
+}
     /**
      * ایندکس کردن دسته‌بندی‌ها
      */
-    public function indexCategories(): void
-    {
-        try {
-            $categories = Category::all();
+   public function indexCategories(): void
+{
+    try {
+        $categories = Category::all();
 
-            if ($categories->isEmpty()) {
-                Log::warning('No categories found to index');
-                return;
-            }
+        if ($categories->isEmpty()) {
+            Log::warning('No categories found to index');
+            return;
+        }
 
-            $indexedCount = 0;
-            foreach ($categories as $category) {
-                $body = [
-                    'category_id' => $category->id,
-                    'category_name' => $category->name ?? '',
-                    'category_keywords' => $category->keyword ?? '',
-                    'category_description' => $category->nameSeo ?? ''
-                ];
+        $indexedCount = 0;
+        foreach ($categories as $category) {
+            // تهیه کلمات کلیدی غنی‌تر
+            $enrichedKeywords = $this->enrichCategoryKeywords($category);
+            
+            $body = [
+                'category_id' => $category->id,
+                'category_name' => $category->name ?? '',
+                'category_keywords' => $enrichedKeywords,
+                'category_description' => $this->prepareCategoryDescription($category),
+                'category_slug' => $category->slug ?? '',
+                'category_type' => $category->type ?? ''
+            ];
 
-                $this->client->index([
-                    'index' => $this->index,
-                    'id' => $category->id,
-                    'body' => $body
-                ]);
+            $this->client->index([
+                'index' => $this->index,
+                'id' => $category->id,
+                'body' => $body
+            ]);
 
-                $indexedCount++;
-            }
+            $indexedCount++;
+        }
 
-            $this->client->indices()->refresh(['index' => $this->index]);
-            Log::info("Categories indexed successfully. Total: {$indexedCount}");
-        } catch (Exception $e) {
-            Log::error('Error indexing categories: ' . $e->getMessage());
-            throw $e;
+        $this->client->indices()->refresh(['index' => $this->index]);
+        Log::info("Categories indexed successfully. Total: {$indexedCount}");
+    } catch (Exception $e) {
+        Log::error('Error indexing categories: ' . $e->getMessage());
+        throw $e;
+    }
+}
+
+private function enrichCategoryKeywords(Category $category): string
+{
+    $keywords = [];
+    
+    // کلمات کلیدی اصلی
+    if ($category->keyword) {
+        $keywords[] = $category->keyword;
+    }
+    
+    // تجزیه نام دسته‌بندی
+    $nameWords = explode(' ', $category->name ?? '');
+    $keywords = array_merge($keywords, $nameWords);
+    
+    // اضافه کردن مترادف‌های عمومی
+    $synonyms = $this->getCategorySynonyms($category->name ?? '');
+    $keywords = array_merge($keywords, $synonyms);
+    
+    // پاک کردن کلمات تکراری و فیلتر کردن
+    $keywords = array_unique($keywords);
+    $keywords = array_filter($keywords, function($word) {
+        return mb_strlen(trim($word)) > 1;
+    });
+    
+    return implode(' ', $keywords);
+}
+
+// تابع دریافت مترادف‌های عمومی
+private function getCategorySynonyms(string $categoryName): array
+{
+    $synonymMap = [
+        'موبایل' => ['گوشی', 'تلفن هوشمند', 'smartphone'],
+        'لپ تاپ' => ['laptop', 'نوت بوک', 'رایانه همراه'],
+        'کتاب' => ['book', 'کتب', 'نشریه'],
+        'لباس' => ['پوشاک', 'dress', 'clothing'],
+        'کفش' => ['shoes', 'پادوش', 'کفش'],
+        'ساعت' => ['watch', 'clock', 'زمان سنج'],
+        'عطر' => ['perfume', 'ادکلن', 'fragrance'],
+        'کیف' => ['bag', 'کیسه', 'ساک'],
+        'عینک' => ['glasses', 'عینک آفتابی', 'eyewear'],
+        'گوشواره' => ['earrings', 'گوشواره', 'jewelry'],
+        'انگشتر' => ['ring', 'حلقه', 'jewelry'],
+        'گردنبند' => ['necklace', 'زنجیر', 'jewelry']
+    ];
+    
+    $synonyms = [];
+    foreach ($synonymMap as $word => $wordSynonyms) {
+        if (stripos($categoryName, $word) !== false) {
+            $synonyms = array_merge($synonyms, $wordSynonyms);
         }
     }
+    
+    return $synonyms;
+}
+
+// تابع آماده‌سازی توضیحات دسته‌بندی
+private function prepareCategoryDescription(Category $category): string
+{
+    $description = [];
+    
+    if ($category->nameSeo) {
+        $description[] = $category->nameSeo;
+    }
+    
+    if ($category->bodySeo) {
+        $description[] = strip_tags($category->bodySeo);
+    }
+    
+    if ($category->body) {
+        $description[] = strip_tags($category->body);
+    }
+    
+    return implode(' ', $description);
+}
 
     /**
      * پردازش تمام محصولات
