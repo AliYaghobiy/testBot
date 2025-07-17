@@ -118,19 +118,26 @@ class AnalyzeCategorization extends Command
         foreach ($qualityAnalysis as $quality => $count) {
             $percentage = $total > 0 ? ($count / $total) * 100 : 0;
             $icon = $this->getQualityIcon($quality);
-            $this->info("{$icon} " . ucfirst($quality) . ": {$count} ({$percentage:.1f}%)");
+            $this->info($icon . ' ' . ucfirst($quality) . ': ' . $count . ' (' . number_format($percentage, 1) . '%)');
         }
     }
 
     private function getQualityIcon(string $quality): string
     {
-        return match($quality) {
-            'excellent' => '🟢',
-            'good' => '🟡',
-            'fair' => '🟠',
-            'poor' => '🔴',
-            'no_match' => '⚫'
-        };
+        switch ($quality) {
+            case 'excellent':
+                return '🟢';
+            case 'good':
+                return '🟡';
+            case 'fair':
+                return '🟠';
+            case 'poor':
+                return '🔴';
+            case 'no_match':
+                return '⚫';
+            default:
+                return '❓';
+        }
     }
 
     private function provideSuggestions(array $qualityAnalysis, array $results): void
@@ -142,7 +149,7 @@ class AnalyzeCategorization extends Command
         $poorQuality = ($qualityAnalysis['poor'] + $qualityAnalysis['no_match']) / $total * 100;
 
         if ($poorQuality > 30) {
-            $this->warn("⚠️ High rate of poor matches ({$poorQuality:.1f}%)");
+            $this->warn('⚠️ High rate of poor matches (' . number_format($poorQuality, 1) . '%)');
             $this->info("Consider:");
             $this->info("• Lowering min_score threshold");
             $this->info("• Adding more category keywords");
@@ -155,7 +162,7 @@ class AnalyzeCategorization extends Command
             if ($result['quality'] === 'poor' || $result['quality'] === 'no_match') {
                 $searchText = $result['search_text'];
                 if (strlen($searchText) < 10) {
-                    $this->warn("Product {$result['product_id']}: Very short search text");
+                    $this->warn('Product ' . $result['product_id'] . ': Very short search text');
                 }
             }
         }
