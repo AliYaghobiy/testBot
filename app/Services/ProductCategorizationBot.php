@@ -37,7 +37,18 @@ class ProductCategorizationBot
     public function findBestCategoryWithScore(Product $product): ?array
     {
         try {
+            // بررسی وجود ایندکس
+            if (!$this->indexExists()) {
+                Log::warning('Index does not exist. Please run setup first.');
+                return null;
+            }
+
             $searchText = $this->prepareSearchText($product);
+
+            if (empty(trim($searchText))) {
+                Log::warning("Empty search text for product {$product->id}");
+                return null;
+            }
 
             $searchParams = [
                 'index' => $this->index,
@@ -73,13 +84,15 @@ class ProductCategorizationBot
                             'minimum_should_match' => 1
                         ]
                     ],
-                    'size' => 1
+                    'size' => 5, // گرفتن چند نتیجه برتر
+                    'min_score' => 0.3 // حداقل امتیاز برای نتایج (کاهش یافته)
                 ]
             ];
 
             $response = $this->client->search($searchParams);
 
             if (empty($response['hits']['hits'])) {
+                Log::info("No matching category found for product {$product->id}");
                 return null;
             }
 
@@ -90,6 +103,7 @@ class ProductCategorizationBot
             $category = Category::find($categoryId);
 
             if (!$category) {
+                Log::warning("Category {$categoryId} not found in database");
                 return null;
             }
 
@@ -101,6 +115,40 @@ class ProductCategorizationBot
             Log::error('Error in findBestCategoryWithScore: ' . $e->getMessage());
             return null;
         }
+    }
+
+    /**
+     * انتخاب بهترین نتیجه از میان نتایج موجود
+     */
+    private function selectBestMatch(array $hits, string $searchText): ?array
+    {
+        if (empty($hits)) {
+            return null;
+        }
+
+        $bestMatch = null;
+        $bestScore = 0;
+
+        foreach ($hits as $hit) {
+            $score = $hit['_score'];
+            $categoryName = $hit['_source']['category_name'];
+            
+            // بررسی تطابق مستقیم با نام دسته‌بندی
+            $directMatch = stripos($searchText, $categoryName) !== false || 
+                          stripos($categoryName, $searchText) !== false;
+            
+            // اگر تطابق مستقیم دارد، امتیاز بیشتری بگیرد
+            if ($directMatch) {
+                $score *= 1.5;
+            }
+
+            if ($score > $bestScore) {
+                $bestScore = $score;
+                $bestMatch = $hit;
+            }
+        }
+
+        return $bestMatch;
     }
 
     /**
@@ -118,13 +166,18 @@ class ProductCategorizationBot
     private function prepareSearchText(Product $product): string
     {
         $searchParts = [
-            $product->title,
-            $product->titleSeo,
-            $product->keyword,
-            $product->body
+            $product->title ?? '',
+            $product->titleSeo ?? '',
+            $product->keyword ?? '',
+            $product->body ?? ''
         ];
 
-        return implode(' ', array_filter($searchParts));
+        // پاک کردن تگ‌های HTML و کاراکترهای اضافی
+        $searchText = implode(' ', array_filter($searchParts));
+        $searchText = strip_tags($searchText);
+        $searchText = preg_replace('/\s+/', ' ', $searchText);
+        
+        return trim($searchText);
     }
 
     /**
@@ -147,6 +200,20 @@ class ProductCategorizationBot
         } catch (Exception $e) {
             Log::error("Error assigning category to product {$product->id}: " . $e->getMessage());
             throw $e;
+        }
+    }
+
+    /**
+     * بررسی وجود ایندکس
+     */
+    private function indexExists(): bool
+    {
+        try {
+            $response = $this->client->indices()->exists(['index' => $this->index]);
+            return $response->getStatusCode() === 200;
+        } catch (Exception $e) {
+            Log::error('Error checking index existence: ' . $e->getMessage());
+            return false;
         }
     }
 
@@ -177,7 +244,12 @@ class ProductCategorizationBot
                             'category_id' => ['type' => 'integer'],
                             'category_name' => [
                                 'type' => 'text',
-                                'analyzer' => 'persian_analyzer'
+                                'analyzer' => 'persian_analyzer',
+                                'fields' => [
+                                    'keyword' => [
+                                        'type' => 'keyword'
+                                    ]
+                                ]
                             ],
                             'category_keywords' => [
                                 'type' => 'text',
@@ -192,11 +264,10 @@ class ProductCategorizationBot
                 ]
             ];
 
-            // بررسی وجود index
-            $indexExists = $this->client->indices()->exists(['index' => $this->index]);
-            
-            if ($indexExists) {
+            // بررسی وجود index و حذف در صورت وجود
+            if ($this->indexExists()) {
                 $this->client->indices()->delete(['index' => $this->index]);
+                Log::info('Existing index deleted');
             }
 
             $this->client->indices()->create($params);
@@ -215,21 +286,31 @@ class ProductCategorizationBot
         try {
             $categories = Category::all();
 
+            if ($categories->isEmpty()) {
+                Log::warning('No categories found to index');
+                return;
+            }
+
+            $indexedCount = 0;
             foreach ($categories as $category) {
+                $body = [
+                    'category_id' => $category->id,
+                    'category_name' => $category->name ?? '',
+                    'category_keywords' => $category->keyword ?? '',
+                    'category_description' => $category->nameSeo ?? ''
+                ];
+
                 $this->client->index([
                     'index' => $this->index,
                     'id' => $category->id,
-                    'body' => [
-                        'category_id' => $category->id,
-                        'category_name' => $category->name,
-                        'category_keywords' => $category->keyword ?? '',
-                        'category_description' => $category->nameSeo ?? ''
-                    ]
+                    'body' => $body
                 ]);
+
+                $indexedCount++;
             }
 
             $this->client->indices()->refresh(['index' => $this->index]);
-            Log::info('Categories indexed successfully');
+            Log::info("Categories indexed successfully. Total: {$indexedCount}");
         } catch (Exception $e) {
             Log::error('Error indexing categories: ' . $e->getMessage());
             throw $e;
@@ -248,6 +329,11 @@ class ProductCategorizationBot
         ];
 
         try {
+            // بررسی وجود ایندکس
+            if (!$this->indexExists()) {
+                throw new Exception('Index does not exist. Please run setup first.');
+            }
+
             Product::chunk(100, function ($products) use (&$results) {
                 foreach ($products as $product) {
                     try {
@@ -284,6 +370,33 @@ class ProductCategorizationBot
         } catch (Exception $e) {
             Log::error('Elasticsearch connection check failed: ' . $e->getMessage());
             return false;
+        }
+    }
+
+    /**
+     * دریافت آمار ایندکس
+     */
+    public function getIndexStats(): array
+    {
+        try {
+            $indexExistsResponse = $this->client->indices()->exists(['index' => $this->index]);
+            $indexExists = $indexExistsResponse->getStatusCode() === 200;
+            
+            if (!$indexExists) {
+                return ['exists' => false];
+            }
+
+            $stats = $this->client->indices()->stats(['index' => $this->index]);
+            $count = $this->client->count(['index' => $this->index]);
+
+            return [
+                'exists' => true,
+                'document_count' => $count['count'],
+                'size' => $stats['indices'][$this->index]['total']['store']['size_in_bytes'] ?? 0
+            ];
+        } catch (Exception $e) {
+            Log::error('Error getting index stats: ' . $e->getMessage());
+            return ['exists' => false, 'error' => $e->getMessage()];
         }
     }
 }
