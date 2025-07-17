@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Category extends Model
 {
@@ -11,9 +12,15 @@ class Category extends Model
         'keyword', 'body', 'slug'
     ];
 
-    public function catables(): MorphMany
+    public function catables(): HasMany
     {
-        return $this->morphMany(Catable::class, 'catables');
+        return $this->hasMany(Catable::class);
+    }
+
+    public function products()
+    {
+        return $this->hasManyThrough(Product::class, Catable::class, 'category_id', 'id', 'id', 'catables_id')
+            ->where('catables_type', Product::class);
     }
 }
 
