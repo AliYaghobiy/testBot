@@ -659,8 +659,7 @@ class ProductCategorizationBot
             foreach ($products as $product) {
                 try {
                     $results['processed']++;
-                    $categoryResult = null;
-
+                    
                     // افزودن timeout برای درخواست‌های Elasticsearch
                     $startTime = microtime(true);
                     $categoryResult = $this->findBestCategoryWithScore($product);
@@ -671,9 +670,26 @@ class ProductCategorizationBot
                         Log::warning("Product {$product->id} processing took {$processingTime} seconds");
                     }
 
-                    if ($categoryResult) {
-                        $this->assignCategoryToProduct($product, $categoryResult['category']);
-                        $results['categorized']++;
+                    // بررسی صحیح نتیجه
+                    if ($categoryResult && isset($categoryResult['category']) && $categoryResult['category'] instanceof Category) {
+                        try {
+                            $this->assignCategoryToProduct($product, $categoryResult['category']);
+                            $results['categorized']++;
+                            
+                            // لاگ موفقیت
+                            Log::info("Product {$product->id} successfully categorized to {$categoryResult['category']->name} with score {$categoryResult['score']}");
+                            
+                        } catch (Exception $assignError) {
+                            Log::error("Error assigning category to product {$product->id}: " . $assignError->getMessage());
+                            $results['errors']++;
+                        }
+                    } else {
+                        // لاگ دقیق‌تر برای حالت‌هایی که دسته‌بندی یافت نشد
+                        if ($categoryResult === null) {
+                            Log::info("No category result for product {$product->id} - result is null");
+                        } else {
+                            Log::info("Invalid category result for product {$product->id}: " . json_encode($categoryResult));
+                        }
                     }
 
                     // فراخوانی callback برای نمایش پیشرفت
@@ -687,6 +703,9 @@ class ProductCategorizationBot
                 } catch (Exception $e) {
                     $results['errors']++;
                     Log::error("Error processing product {$product->id}: " . $e->getMessage());
+                    
+                    // اضافه کردن stack trace برای debugging بهتر
+                    Log::error("Stack trace: " . $e->getTraceAsString());
 
                     // فراخوانی callback برای نمایش خطا
                     if ($progressCallback) {
@@ -702,6 +721,9 @@ class ProductCategorizationBot
             usleep(100000); // 100ms
         });
 
+        // لاگ نهایی
+        Log::info("ProcessAllProducts completed. Processed: {$results['processed']}, Categorized: {$results['categorized']}, Errors: {$results['errors']}");
+
     } catch (Exception $e) {
         Log::error('Error in processAllProducts: ' . $e->getMessage());
         throw $e;
@@ -709,6 +731,43 @@ class ProductCategorizationBot
 
     return $results;
 }
+
+/**
+ * تست یک محصول خاص برای debugging
+ */
+public function testSingleProduct(int $productId): array
+{
+    $product = Product::find($productId);
+    
+    if (!$product) {
+        return ['error' => 'Product not found'];
+    }
+
+    $searchText = $this->prepareSearchText($product);
+    Log::info("Testing product {$productId} with search text: {$searchText}");
+    
+    $categoryResult = $this->findBestCategoryWithScore($product);
+    
+    if ($categoryResult) {
+        Log::info("Found category for product {$productId}: {$categoryResult['category']->name} with score {$categoryResult['score']}");
+        return [
+            'success' => true,
+            'product_id' => $productId,
+            'category' => $categoryResult['category']->name,
+            'score' => $categoryResult['score'],
+            'search_text' => $searchText
+        ];
+    } else {
+        Log::warning("No category found for product {$productId}");
+        return [
+            'success' => false,
+            'product_id' => $productId,
+            'search_text' => $searchText,
+            'message' => 'No category found'
+        ];
+    }
+}
+
     /**
      * بررسی وضعیت اتصال به Elasticsearch
      */
