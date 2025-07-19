@@ -4,9 +4,11 @@ namespace App\Services;
 
 use App\Models\Product;
 use App\Models\Category;
+use App\Models\Catable;
 use Elastic\Elasticsearch\ClientBuilder;
 use Elastic\Elasticsearch\Client;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
 use Exception;
 
 class ProductCategorizationBot
@@ -137,7 +139,7 @@ class ProductCategorizationBot
                         ]
                     ],
                     'size' => 20,
-                    'min_score' => 0.1, // کاهش شدید حداقل امتیاز
+                    'min_score' => 0.01, // کاهش بیشتر حداقل امتیاز
                     '_source' => ['category_id', 'category_name', 'category_keywords', 'category_slug']
                 ]
             ];
@@ -153,6 +155,7 @@ class ProductCategorizationBot
             $bestMatch = $this->selectBestMatchImproved($response['hits']['hits'], $searchText, $titleKeywords);
 
             if (!$bestMatch) {
+                Log::info("No suitable match found after scoring for product {$product->id}");
                 return null;
             }
 
@@ -366,20 +369,25 @@ class ProductCategorizationBot
     }
 
     /**
-     * اختصاص دسته‌بندی به محصول
+     * اختصاص دسته‌بندی به محصول - نسخه اصلاح شده برای جدول بدون timestamps
      */
     public function assignCategoryToProduct(Product $product, Category $category): void
     {
         try {
+            DB::beginTransaction();
+
             // حذف دسته‌بندی‌های قبلی محصول
-            $product->catables()->delete();
+            DB::table('catables')
+               ->where('catables_id', $product->id)
+               ->where('catables_type', Product::class)
+               ->delete();
 
             // دریافت تمام دسته‌های مادر با ترتیب صحیح
             $parentCategories = $category->getAllParentCategories();
 
             // اختصاص دسته‌های مادر (از کلی به خاص)
             foreach ($parentCategories as $parentCategory) {
-                $product->catables()->create([
+                DB::table('catables')->insert([
                     'category_id' => $parentCategory['id'],
                     'catables_id' => $product->id,
                     'catables_type' => Product::class
@@ -387,16 +395,19 @@ class ProductCategorizationBot
             }
 
             // اختصاص دسته اصلی (خاص‌ترین دسته)
-            $product->catables()->create([
+            DB::table('catables')->insert([
                 'category_id' => $category->id,
                 'catables_id' => $product->id,
                 'catables_type' => Product::class
             ]);
 
+            DB::commit();
+
             $totalAssigned = 1 + count($parentCategories);
             Log::info("Product {$product->id} assigned to category {$category->id} and {$totalAssigned} total categories (including parents)");
 
         } catch (Exception $e) {
+            DB::rollBack();
             Log::error("Error assigning category to product {$product->id}: " . $e->getMessage());
             throw $e;
         }
@@ -639,134 +650,133 @@ class ProductCategorizationBot
     }
 
     /**
-     * پردازش تمام محصولات
+     * پردازش تمام محصولات - نسخه کاملاً اصلاح شده
      */
-   public function processAllProducts(callable $progressCallback = null): array
-{
-    $results = [
-        'processed' => 0,
-        'categorized' => 0,
-        'errors' => 0
-    ];
+    public function processAllProducts(callable $progressCallback = null): array
+    {
+        $results = [
+            'processed' => 0,
+            'categorized' => 0,
+            'errors' => 0
+        ];
 
-    try {
-        if (!$this->indexExists()) {
-            throw new Exception('Index does not exist. Please run setup first.');
-        }
+        try {
+            if (!$this->indexExists()) {
+                throw new Exception('Index does not exist. Please run setup first.');
+            }
 
-        // پردازش محصولات در دسته‌های کوچک‌تر برای جلوگیری از timeout
-        Product::chunk(50, function ($products) use (&$results, $progressCallback) {
-            foreach ($products as $product) {
+            // پردازش محصولات یکی یکی بجای chunk
+            $totalProducts = Product::count();
+            Log::info("Starting to process {$totalProducts} products");
+
+            Product::orderBy('id')->chunk(1, function ($products) use (&$results, $progressCallback) {
+                $product = $products->first();
+                
                 try {
                     $results['processed']++;
                     
-                    // افزودن timeout برای درخواست‌های Elasticsearch
-                    $startTime = microtime(true);
-                    $categoryResult = $this->findBestCategoryWithScore($product);
-                    $processingTime = microtime(true) - $startTime;
-
-                    // اگر پردازش بیش از 5 ثانیه طول کشید، خطا ثبت می‌کنیم
-                    if ($processingTime > 5) {
-                        Log::warning("Product {$product->id} processing took {$processingTime} seconds");
+                    // آماده‌سازی متن جستجو برای debug
+                    $searchText = $this->prepareSearchText($product);
+                    
+                    if (empty(trim($searchText))) {
+                        Log::warning("Empty search text for product {$product->id}");
+                        if ($progressCallback) {
+                            $progressCallback($product->id, null, $results['processed'], $results['categorized']);
+                        }
+                        return;
                     }
 
-                    // بررسی صحیح نتیجه
+                    // یافتن دسته‌بندی
+                    $categoryResult = $this->findBestCategoryWithScore($product);
+
                     if ($categoryResult && isset($categoryResult['category']) && $categoryResult['category'] instanceof Category) {
                         try {
+                            // اختصاص دسته‌بندی به محصول
                             $this->assignCategoryToProduct($product, $categoryResult['category']);
                             $results['categorized']++;
                             
-                            // لاگ موفقیت
-                            Log::info("Product {$product->id} successfully categorized to {$categoryResult['category']->name} with score {$categoryResult['score']}");
+                            Log::info("✅ Product {$product->id} successfully categorized to {$categoryResult['category']->name} with score {$categoryResult['score']}");
+                            
+                            // فراخوانی callback برای نمایش موفقیت
+                            if ($progressCallback) {
+                                $progressCallback($product->id, $categoryResult, $results['processed'], $results['categorized']);
+                            }
                             
                         } catch (Exception $assignError) {
-                            Log::error("Error assigning category to product {$product->id}: " . $assignError->getMessage());
                             $results['errors']++;
+                            Log::error("❌ Error assigning category to product {$product->id}: " . $assignError->getMessage());
+                            
+                            if ($progressCallback) {
+                                $progressCallback($product->id, null, $results['processed'], $results['categorized']);
+                            }
                         }
                     } else {
-                        // لاگ دقیق‌تر برای حالت‌هایی که دسته‌بندی یافت نشد
-                        if ($categoryResult === null) {
-                            Log::info("No category result for product {$product->id} - result is null");
-                        } else {
-                            Log::info("Invalid category result for product {$product->id}: " . json_encode($categoryResult));
+                        Log::info("❌ No category found for product {$product->id} with search text: {$searchText}");
+                        
+                        if ($progressCallback) {
+                            $progressCallback($product->id, null, $results['processed'], $results['categorized']);
                         }
-                    }
-
-                    // فراخوانی callback برای نمایش پیشرفت
-                    if ($progressCallback) {
-                        $progressCallback($product->id, $categoryResult, $results['processed'], $results['categorized']);
                     }
 
                     // تاخیر کوچک برای جلوگیری از فشار بیش از حد
-                    usleep(10000); // 10ms
+                    usleep(50000); // 50ms
 
                 } catch (Exception $e) {
                     $results['errors']++;
-                    Log::error("Error processing product {$product->id}: " . $e->getMessage());
-                    
-                    // اضافه کردن stack trace برای debugging بهتر
-                    Log::error("Stack trace: " . $e->getTraceAsString());
+                    Log::error("❌ Error processing product {$product->id}: " . $e->getMessage());
 
                     // فراخوانی callback برای نمایش خطا
                     if ($progressCallback) {
                         $progressCallback($product->id, null, $results['processed'], $results['categorized']);
                     }
-
-                    // در صورت خطا، تاخیر بیشتری اعمال می‌کنیم
-                    sleep(1);
                 }
-            }
+            });
 
-            // تاخیر بین چانک‌ها
-            usleep(100000); // 100ms
-        });
+            Log::info("ProcessAllProducts completed. Processed: {$results['processed']}, Categorized: {$results['categorized']}, Errors: {$results['errors']}");
 
-        // لاگ نهایی
-        Log::info("ProcessAllProducts completed. Processed: {$results['processed']}, Categorized: {$results['categorized']}, Errors: {$results['errors']}");
+        } catch (Exception $e) {
+            Log::error('Error in processAllProducts: ' . $e->getMessage());
+            throw $e;
+        }
 
-    } catch (Exception $e) {
-        Log::error('Error in processAllProducts: ' . $e->getMessage());
-        throw $e;
+        return $results;
     }
 
-    return $results;
-}
+    /**
+     * تست یک محصول خاص برای debugging
+     */
+    public function testSingleProduct(int $productId): array
+    {
+        $product = Product::find($productId);
+        
+        if (!$product) {
+            return ['error' => 'Product not found'];
+        }
 
-/**
- * تست یک محصول خاص برای debugging
- */
-public function testSingleProduct(int $productId): array
-{
-    $product = Product::find($productId);
-    
-    if (!$product) {
-        return ['error' => 'Product not found'];
+        $searchText = $this->prepareSearchText($product);
+        Log::info("Testing product {$productId} with search text: {$searchText}");
+        
+        $categoryResult = $this->findBestCategoryWithScore($product);
+        
+        if ($categoryResult) {
+            Log::info("Found category for product {$productId}: {$categoryResult['category']->name} with score {$categoryResult['score']}");
+            return [
+                'success' => true,
+                'product_id' => $productId,
+                'category' => $categoryResult['category']->name,
+                'score' => $categoryResult['score'],
+                'search_text' => $searchText
+            ];
+        } else {
+            Log::warning("No category found for product {$productId}");
+            return [
+                'success' => false,
+                'product_id' => $productId,
+                'search_text' => $searchText,
+                'message' => 'No category found'
+            ];
+        }
     }
-
-    $searchText = $this->prepareSearchText($product);
-    Log::info("Testing product {$productId} with search text: {$searchText}");
-    
-    $categoryResult = $this->findBestCategoryWithScore($product);
-    
-    if ($categoryResult) {
-        Log::info("Found category for product {$productId}: {$categoryResult['category']->name} with score {$categoryResult['score']}");
-        return [
-            'success' => true,
-            'product_id' => $productId,
-            'category' => $categoryResult['category']->name,
-            'score' => $categoryResult['score'],
-            'search_text' => $searchText
-        ];
-    } else {
-        Log::warning("No category found for product {$productId}");
-        return [
-            'success' => false,
-            'product_id' => $productId,
-            'search_text' => $searchText,
-            'message' => 'No category found'
-        ];
-    }
-}
 
     /**
      * بررسی وضعیت اتصال به Elasticsearch

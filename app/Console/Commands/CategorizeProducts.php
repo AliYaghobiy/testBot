@@ -27,7 +27,7 @@ class CategorizeProducts extends Command
         
         // تنظیم callback برای نمایش پیشرفت
         $results = $bot->processAllProducts(function($productId, $categoryResult, $processed, $categorized) {
-            if ($categoryResult) {
+            if ($categoryResult && isset($categoryResult['category']) && $categoryResult['category']) {
                 $category = $categoryResult['category'];
                 $score = number_format($categoryResult['score'], 1);
                 
