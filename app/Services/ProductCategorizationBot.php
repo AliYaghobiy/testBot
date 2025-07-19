@@ -641,63 +641,74 @@ class ProductCategorizationBot
     /**
      * پردازش تمام محصولات
      */
-    public function processAllProducts(): array
-    {
-        $results = [
-            'processed' => 0,
-            'categorized' => 0,
-            'errors' => 0
-        ];
+   public function processAllProducts(callable $progressCallback = null): array
+{
+    $results = [
+        'processed' => 0,
+        'categorized' => 0,
+        'errors' => 0
+    ];
 
-        try {
-            if (!$this->indexExists()) {
-                throw new Exception('Index does not exist. Please run setup first.');
-            }
-
-            // پردازش محصولات در دسته‌های کوچک‌تر برای جلوگیری از timeout
-            Product::chunk(50, function ($products) use (&$results) {
-                foreach ($products as $product) {
-                    try {
-                        $results['processed']++;
-
-                        // افزودن timeout برای درخواست‌های Elasticsearch
-                        $startTime = microtime(true);
-                        $categoryResult = $this->findBestCategoryWithScore($product);
-                        $processingTime = microtime(true) - $startTime;
-
-                        // اگر پردازش بیش از 5 ثانیه طول کشید، خطا ثبت می‌کنیم
-                        if ($processingTime > 5) {
-                            Log::warning("Product {$product->id} processing took {$processingTime} seconds");
-                        }
-
-                        if ($categoryResult) {
-                            $this->assignCategoryToProduct($product, $categoryResult['category']);
-                            $results['categorized']++;
-                        }
-
-                        // تاخیر کوچک برای جلوگیری از فشار بیش از حد
-                        usleep(10000); // 10ms
-
-                    } catch (Exception $e) {
-                        $results['errors']++;
-                        Log::error("Error processing product {$product->id}: " . $e->getMessage());
-
-                        // در صورت خطا، تاخیر بیشتری اعمال می‌کنیم
-                        sleep(1);
-                    }
-                }
-
-                // تاخیر بین چانک‌ها
-                usleep(100000); // 100ms
-            });
-
-        } catch (Exception $e) {
-            Log::error('Error in processAllProducts: ' . $e->getMessage());
-            throw $e;
+    try {
+        if (!$this->indexExists()) {
+            throw new Exception('Index does not exist. Please run setup first.');
         }
 
-        return $results;
+        // پردازش محصولات در دسته‌های کوچک‌تر برای جلوگیری از timeout
+        Product::chunk(50, function ($products) use (&$results, $progressCallback) {
+            foreach ($products as $product) {
+                try {
+                    $results['processed']++;
+                    $categoryResult = null;
+
+                    // افزودن timeout برای درخواست‌های Elasticsearch
+                    $startTime = microtime(true);
+                    $categoryResult = $this->findBestCategoryWithScore($product);
+                    $processingTime = microtime(true) - $startTime;
+
+                    // اگر پردازش بیش از 5 ثانیه طول کشید، خطا ثبت می‌کنیم
+                    if ($processingTime > 5) {
+                        Log::warning("Product {$product->id} processing took {$processingTime} seconds");
+                    }
+
+                    if ($categoryResult) {
+                        $this->assignCategoryToProduct($product, $categoryResult['category']);
+                        $results['categorized']++;
+                    }
+
+                    // فراخوانی callback برای نمایش پیشرفت
+                    if ($progressCallback) {
+                        $progressCallback($product->id, $categoryResult, $results['processed'], $results['categorized']);
+                    }
+
+                    // تاخیر کوچک برای جلوگیری از فشار بیش از حد
+                    usleep(10000); // 10ms
+
+                } catch (Exception $e) {
+                    $results['errors']++;
+                    Log::error("Error processing product {$product->id}: " . $e->getMessage());
+
+                    // فراخوانی callback برای نمایش خطا
+                    if ($progressCallback) {
+                        $progressCallback($product->id, null, $results['processed'], $results['categorized']);
+                    }
+
+                    // در صورت خطا، تاخیر بیشتری اعمال می‌کنیم
+                    sleep(1);
+                }
+            }
+
+            // تاخیر بین چانک‌ها
+            usleep(100000); // 100ms
+        });
+
+    } catch (Exception $e) {
+        Log::error('Error in processAllProducts: ' . $e->getMessage());
+        throw $e;
     }
+
+    return $results;
+}
     /**
      * بررسی وضعیت اتصال به Elasticsearch
      */
