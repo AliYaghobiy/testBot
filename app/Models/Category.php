@@ -43,18 +43,46 @@ class Category extends Model
     public function getAllParentCategories(): array
     {
         $allParents = [];
-        $currentParents = $this->getParentCategories();
+        $visited = [];
 
-        foreach ($currentParents as $parent) {
-            $allParents[] = $parent;
-            $parentCategory = Category::find($parent['id']);
-            if ($parentCategory) {
-                $grandParents = $parentCategory->getAllParentCategories();
-                $allParents = array_merge($allParents, $grandParents);
-            }
+        return $this->getParentCategoriesRecursive($visited);
+    }
+
+    /**
+     * متد کمکی برای دریافت والدین به صورت بازگشتی
+     */
+    private function getParentCategoriesRecursive(array &$visited): array
+    {
+        // جلوگیری از حلقه بی‌نهایت
+        if (in_array($this->id, $visited)) {
+            return [];
         }
 
-        // حذف دسته‌های تکراری
+        $visited[] = $this->id;
+
+        $parentIds = \DB::table('catables')
+            ->where('catables_id', $this->id)
+            ->where('catables_type', Category::class)
+            ->pluck('category_id')
+            ->toArray();
+
+        if (empty($parentIds)) {
+            return [];
+        }
+
+        $directParents = Category::whereIn('id', $parentIds)->get();
+        $allParents = [];
+
+        foreach ($directParents as $parent) {
+            // ابتدا والدین بالاتر را اضافه می‌کنیم (کلی‌تر)
+            $grandParents = $parent->getParentCategoriesRecursive($visited);
+            $allParents = array_merge($allParents, $grandParents);
+
+            // سپس خود والد مستقیم را اضافه می‌کنیم
+            $allParents[] = $parent->toArray();
+        }
+
+        // حذف دوبله‌ها بر اساس ID
         $uniqueParents = [];
         $seenIds = [];
 
@@ -69,16 +97,16 @@ class Category extends Model
     }
 
     /**
-     * دریافت کل مسیر سلسله مراتبی دسته‌بندی
+     * دریافت کل مسیر سلسله مراتبی دسته‌بندی با ترتیب صحیح
      */
     public function getCategoryPath(): array
     {
-        $path = [$this->toArray()];
         $parents = $this->getAllParentCategories();
 
-        // مرتب کردن والدها از کلی به خاص
-        $parents = array_reverse($parents);
+        // والدین به ترتیب صحیح هستند (از کلی به خاص)
+        // اکنون فقط خود دسته را در انتها اضافه می‌کنیم
+        $parents[] = $this->toArray();
 
-        return array_merge($parents, $path);
+        return $parents;
     }
 }

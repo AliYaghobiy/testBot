@@ -45,8 +45,16 @@ class TestProductCategorization extends Command
         $headers = ['ID', 'Product Title', 'Search Text Preview', 'Suggested Category', 'Parent Categories', 'Score', 'Status'];
         $tableData = [];
 
-        foreach ($products as $product) {
+        // ایجاد progress bar
+        $bar = $this->output->createProgressBar($count);
+        $bar->setFormat('Processing: %current%/%max% [%bar%] %percent:3s%% %memory:6s%');
+
+        foreach ($products as $index => $product) {
             try {
+                // به‌روزرسانی progress bar
+                $bar->setMessage("Processing product {$product->id}...");
+                $bar->advance();
+
                 // یافتن بهترین دسته‌بندی
                 $categoryResult = $bot->findBestCategoryWithScore($product);
                 $searchText = $this->prepareSearchText($product);
@@ -55,13 +63,13 @@ class TestProductCategorization extends Command
                     $category = $categoryResult['category'];
                     $score = $categoryResult['score'];
 
-                    // دریافت دسته‌های مادر
+                    // دریافت دسته‌های مادر با ترتیب صحیح
                     $parentCategories = $category->getAllParentCategories();
                     $parentNames = array_map(function($cat) {
                         return $cat['name'];
                     }, $parentCategories);
 
-                    // ایجاد مسیر کامل
+                    // ایجاد مسیر کامل با ترتیب صحیح
                     $fullPath = array_merge($parentNames, [$category->name]);
                     $pathString = implode(' / ', $fullPath);
 
@@ -76,8 +84,10 @@ class TestProductCategorization extends Command
                     ];
 
                     if ($showDetails) {
+                        $this->newLine();
                         $this->info("Full Category Path: {$pathString}");
                         $this->info("Total Categories (including parents): " . (count($parentCategories) + 1));
+                        $this->showProductDetails($product, $categoryResult);
                     }
 
                     $successCount++;
@@ -91,11 +101,15 @@ class TestProductCategorization extends Command
                         '0.00',
                         '❌ Failed'
                     ];
+
+                    if ($showDetails) {
+                        $this->newLine();
+                        $this->showProductDetails($product, null);
+                    }
                 }
 
-                if ($showDetails) {
-                    $this->showProductDetails($product, $categoryResult);
-                }
+                // افزودن تاخیر کوچک برای جلوگیری از فشار بیش از حد به Elasticsearch
+                usleep(50000); // 50ms تاخیر
 
             } catch (\Exception $e) {
                 $tableData[] = [
@@ -108,9 +122,18 @@ class TestProductCategorization extends Command
                     '⚠️ Error'
                 ];
 
+                $this->newLine();
                 $this->error("Error processing product {$product->id}: " . $e->getMessage());
+
+                // در صورت خطا، تاخیر بیشتری اعمال می‌کنیم
+                sleep(1);
             }
         }
+
+        // پایان progress bar
+        $bar->finish();
+        $this->newLine(2);
+
         // نمایش جدول نتایج
         $this->table($headers, $tableData);
 
@@ -137,6 +160,7 @@ class TestProductCategorization extends Command
             }
         }
     }
+
 
     /**
      * بررسی وضعیت سیستم

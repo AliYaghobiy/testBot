@@ -374,31 +374,24 @@ class ProductCategorizationBot
             // حذف دسته‌بندی‌های قبلی محصول
             $product->catables()->delete();
 
-            // دریافت تمام دسته‌های مادر
+            // دریافت تمام دسته‌های مادر با ترتیب صحیح
             $parentCategories = $category->getAllParentCategories();
 
-            // اختصاص دسته اصلی
+            // اختصاص دسته‌های مادر (از کلی به خاص)
+            foreach ($parentCategories as $parentCategory) {
+                $product->catables()->create([
+                    'category_id' => $parentCategory['id'],
+                    'catables_id' => $product->id,
+                    'catables_type' => Product::class
+                ]);
+            }
+
+            // اختصاص دسته اصلی (خاص‌ترین دسته)
             $product->catables()->create([
                 'category_id' => $category->id,
                 'catables_id' => $product->id,
                 'catables_type' => Product::class
             ]);
-
-            // اختصاص دسته‌های مادر
-            foreach ($parentCategories as $parentCategory) {
-                // بررسی اینکه این دسته قبلاً اختصاص داده نشده باشد
-                $exists = $product->catables()
-                    ->where('category_id', $parentCategory['id'])
-                    ->exists();
-
-                if (!$exists) {
-                    $product->catables()->create([
-                        'category_id' => $parentCategory['id'],
-                        'catables_id' => $product->id,
-                        'catables_type' => Product::class
-                    ]);
-                }
-            }
 
             $totalAssigned = 1 + count($parentCategories);
             Log::info("Product {$product->id} assigned to category {$category->id} and {$totalAssigned} total categories (including parents)");
@@ -661,23 +654,43 @@ class ProductCategorizationBot
                 throw new Exception('Index does not exist. Please run setup first.');
             }
 
-            Product::chunk(100, function ($products) use (&$results) {
+            // پردازش محصولات در دسته‌های کوچک‌تر برای جلوگیری از timeout
+            Product::chunk(50, function ($products) use (&$results) {
                 foreach ($products as $product) {
                     try {
                         $results['processed']++;
 
+                        // افزودن timeout برای درخواست‌های Elasticsearch
+                        $startTime = microtime(true);
                         $categoryResult = $this->findBestCategoryWithScore($product);
+                        $processingTime = microtime(true) - $startTime;
+
+                        // اگر پردازش بیش از 5 ثانیه طول کشید، خطا ثبت می‌کنیم
+                        if ($processingTime > 5) {
+                            Log::warning("Product {$product->id} processing took {$processingTime} seconds");
+                        }
 
                         if ($categoryResult) {
                             $this->assignCategoryToProduct($product, $categoryResult['category']);
                             $results['categorized']++;
                         }
+
+                        // تاخیر کوچک برای جلوگیری از فشار بیش از حد
+                        usleep(10000); // 10ms
+
                     } catch (Exception $e) {
                         $results['errors']++;
                         Log::error("Error processing product {$product->id}: " . $e->getMessage());
+
+                        // در صورت خطا، تاخیر بیشتری اعمال می‌کنیم
+                        sleep(1);
                     }
                 }
+
+                // تاخیر بین چانک‌ها
+                usleep(100000); // 100ms
             });
+
         } catch (Exception $e) {
             Log::error('Error in processAllProducts: ' . $e->getMessage());
             throw $e;
@@ -685,7 +698,6 @@ class ProductCategorizationBot
 
         return $results;
     }
-
     /**
      * بررسی وضعیت اتصال به Elasticsearch
      */
