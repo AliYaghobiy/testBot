@@ -665,6 +665,134 @@ private function productHasCategory(Product $product): bool
               ->exists();
 }
 
+
+    public function hasExistingCategory(Product $product): bool
+    {
+        try {
+            // بررسی با قفل برای جلوگیری از race condition
+            $categoryCount = DB::table('catables')
+                ->where('catables_id', $product->id)
+                ->where('catables_type', Product::class)
+                ->lockForUpdate()
+                ->count();
+
+            $hasCategory = $categoryCount > 0;
+
+            // لاگ دقیق‌تر برای debugging
+            if ($hasCategory) {
+                Log::info("Product {$product->id} already has {$categoryCount} category assignment(s) - SKIPPING");
+            }
+
+            return $hasCategory;
+
+        } catch (Exception $e) {
+            Log::error("Error checking category for product {$product->id}: " . $e->getMessage());
+            // در صورت خطا، فرض کنیم محصول دسته‌بندی دارد تا از تکرار جلوگیری شود
+            return true;
+        }
+    }
+
+
+    /**
+     * ذخیره آخرین محصول پردازش شده
+     */
+    private function saveLastProcessedProduct(int $productId): void
+    {
+        try {
+            $progressFile = storage_path('app/categorization_progress.json');
+            $data = [
+                'last_processed_id' => $productId,
+                'timestamp' => now()->toDateTimeString(),
+                'process_id' => getmypid()
+            ];
+
+            file_put_contents($progressFile, json_encode($data, JSON_PRETTY_PRINT));
+
+        } catch (Exception $e) {
+            Log::warning('Could not save progress: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * دریافت آخرین محصول پردازش شده
+     */
+    private function getLastProcessedProduct(): ?int
+    {
+        try {
+            $progressFile = storage_path('app/categorization_progress.json');
+
+            if (!file_exists($progressFile)) {
+                return null;
+            }
+
+            $data = json_decode(file_get_contents($progressFile), true);
+
+            if (!$data || !isset($data['last_processed_id'])) {
+                return null;
+            }
+
+            Log::info("Found previous progress: Last processed product ID was {$data['last_processed_id']}");
+            return (int)$data['last_processed_id'];
+
+        } catch (Exception $e) {
+            Log::warning('Could not read progress file: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * پاک کردن فایل پیشرفت (در صورت اتمام موفقیت‌آمیز)
+     */
+    private function clearProgress(): void
+    {
+        try {
+            $progressFile = storage_path('app/categorization_progress.json');
+            if (file_exists($progressFile)) {
+                unlink($progressFile);
+                Log::info('Progress file cleared successfully');
+            }
+        } catch (Exception $e) {
+            Log::warning('Could not clear progress file: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * نمایش نوار پیشرفت
+     */
+    private function displayProgressBar(int $current, int $total, int $categorized, int $skipped, int $errors): void
+    {
+        $percentage = $total > 0 ? round(($current / $total) * 100, 2) : 0;
+        $barLength = 50;
+        $filledLength = round(($percentage / 100) * $barLength);
+
+        $bar = str_repeat('█', $filledLength) . str_repeat('░', $barLength - $filledLength);
+
+        $progressLine = sprintf(
+            "\r🤖 Progress: [%s] %s%% (%d/%d) | ✅ %d | ⏭️ %d | ❌ %d",
+            $bar,
+            $percentage,
+            $current,
+            $total,
+            $categorized,
+            $skipped,
+            $errors
+        );
+
+        // اگر از command line استفاده می‌شود
+        if (defined('STDOUT')) {
+            fwrite(STDOUT, $progressLine);
+            fflush(STDOUT);
+        }
+
+        // لاگ هر 1% پیشرفت
+        if ($percentage > 0 && $percentage % 1 === 0.0) {
+            Log::info("Categorization Progress: {$percentage}% completed ({$current}/{$total})");
+        }
+    }
+    
+    /**
+     * پردازش تمام محصولات با قابلیت Resume - نسخه کاملاً اصلاح شده
+     */
     public function processAllProducts(callable $progressCallback = null): array
     {
         $results = [
@@ -679,85 +807,111 @@ private function productHasCategory(Product $product): bool
                 throw new Exception('Index does not exist. Please run setup first.');
             }
 
-            // پردازش محصولات یکی یکی بجای chunk
-            $totalProducts = Product::count();
-            Log::info("Starting to process {$totalProducts} products");
+            // دریافت آخرین محصول پردازش شده
+            $lastProcessedId = $this->getLastProcessedProduct();
+            $startFromId = $lastProcessedId ? $lastProcessedId + 1 : 0;
 
-            Product::orderBy('id')->chunk(1, function ($products) use (&$results, $progressCallback) {
-                $product = $products->first();
+            if ($lastProcessedId) {
+                Log::info("Resuming categorization from product ID: {$startFromId}");
+            } else {
+                Log::info("Starting fresh categorization process");
+            }
 
-                try {
-                    $results['processed']++;
+            // شمارش کل محصولات باقیمانده
+            $totalRemainingProducts = Product::where('id', '>=', $startFromId)->count();
+            Log::info("Total products to process: {$totalRemainingProducts}");
 
-                    // بررسی اینکه آیا محصول از قبل دسته‌بندی دارد یا نه
-                    if ($this->hasExistingCategory($product)) {
-                        $results['skipped']++;
-                        Log::warning("❌ Product {$product->id} already has category assignment - SKIPPED");
+            // پردازش محصولات از آخرین نقطه
+            Product::where('id', '>=', $startFromId)
+                ->orderBy('id')
+                ->chunk(1, function ($products) use (&$results, $progressCallback) {
+                    $product = $products->first();
 
-                        if ($progressCallback) {
-                            $progressCallback($product->id, ['already_categorized' => true], $results['processed'], $results['categorized'], $results['skipped']);
+                    try {
+                        $results['processed']++;
+
+                        // ذخیره پیشرفت هر 5 محصول
+                        if ($results['processed'] % 5 === 0) {
+                            $this->saveLastProcessedProduct($product->id);
                         }
-                        return;
-                    }
 
-                    // آماده‌سازی متن جستجو برای debug
-                    $searchText = $this->prepareSearchText($product);
+                        // بررسی دقیق‌تر وجود دسته‌بندی
+                        if ($this->hasExistingCategory($product)) {
+                            $results['skipped']++;
+                            Log::info("Product {$product->id} already categorized - SKIPPED");
 
-                    if (empty(trim($searchText))) {
-                        Log::warning("Empty search text for product {$product->id}");
-                        if ($progressCallback) {
-                            $progressCallback($product->id, null, $results['processed'], $results['categorized'], $results['skipped']);
-                        }
-                        return;
-                    }
-
-                    // یافتن دسته‌بندی
-                    $categoryResult = $this->findBestCategoryWithScore($product);
-
-                    if ($categoryResult && isset($categoryResult['category']) && $categoryResult['category'] instanceof Category) {
-                        try {
-                            // اختصاص دسته‌بندی به محصول
-                            $this->assignCategoryToProduct($product, $categoryResult['category']);
-                            $results['categorized']++;
-
-                            Log::info("✅ Product {$product->id} successfully categorized to {$categoryResult['category']->name} with score {$categoryResult['score']}");
-
-                            // فراخوانی callback برای نمایش موفقیت
                             if ($progressCallback) {
-                                $progressCallback($product->id, $categoryResult, $results['processed'], $results['categorized'], $results['skipped']);
+                                $progressCallback($product->id, ['already_categorized' => true], $results['processed'], $results['categorized'], $results['skipped']);
                             }
+                            return;
+                        }
 
-                        } catch (Exception $assignError) {
-                            $results['errors']++;
-                            Log::error("❌ Error assigning category to product {$product->id}: " . $assignError->getMessage());
+                        // آماده‌سازی متن جستجو
+                        $searchText = $this->prepareSearchText($product);
+
+                        if (empty(trim($searchText))) {
+                            Log::warning("Empty search text for product {$product->id}");
+                            if ($progressCallback) {
+                                $progressCallback($product->id, null, $results['processed'], $results['categorized'], $results['skipped']);
+                            }
+                            return;
+                        }
+
+                        // یافتن دسته‌بندی
+                        $categoryResult = $this->findBestCategoryWithScore($product);
+
+                        if ($categoryResult && isset($categoryResult['category']) && $categoryResult['category'] instanceof Category) {
+                            try {
+                                // بررسی مجدد قبل از اختصاص (double-check)
+                                if ($this->hasExistingCategory($product)) {
+                                    $results['skipped']++;
+                                    Log::warning("Product {$product->id} got categorized by another process - SKIPPED");
+                                    return;
+                                }
+
+                                // اختصاص دسته‌بندی به محصول
+                                $this->assignCategoryToProduct($product, $categoryResult['category']);
+                                $results['categorized']++;
+
+                                Log::info("✅ Product {$product->id} successfully categorized to {$categoryResult['category']->name} with score {$categoryResult['score']}");
+
+                                if ($progressCallback) {
+                                    $progressCallback($product->id, $categoryResult, $results['processed'], $results['categorized'], $results['skipped']);
+                                }
+
+                            } catch (Exception $assignError) {
+                                $results['errors']++;
+                                Log::error("❌ Error assigning category to product {$product->id}: " . $assignError->getMessage());
+
+                                if ($progressCallback) {
+                                    $progressCallback($product->id, null, $results['processed'], $results['categorized'], $results['skipped']);
+                                }
+                            }
+                        } else {
+                            Log::info("No category found for product {$product->id}");
 
                             if ($progressCallback) {
                                 $progressCallback($product->id, null, $results['processed'], $results['categorized'], $results['skipped']);
                             }
                         }
-                    } else {
-                        Log::info("❌ No category found for product {$product->id} with search text: {$searchText}");
+
+                        // تاخیر کوچک
+                        usleep(50000); // 50ms
+
+                    } catch (Exception $e) {
+                        $results['errors']++;
+                        Log::error("❌ Error processing product {$product->id}: " . $e->getMessage());
 
                         if ($progressCallback) {
                             $progressCallback($product->id, null, $results['processed'], $results['categorized'], $results['skipped']);
                         }
                     }
+                });
 
-                    // تاخیر کوچک برای جلوگیری از فشار بیش از حد
-                    usleep(50000); // 50ms
+            // در صورت اتمام موفقیت‌آمیز، فایل پیشرفت را پاک کن
+            $this->clearProgress();
 
-                } catch (Exception $e) {
-                    $results['errors']++;
-                    Log::error("❌ Error processing product {$product->id}: " . $e->getMessage());
-
-                    // فراخوانی callback برای نمایش خطا
-                    if ($progressCallback) {
-                        $progressCallback($product->id, null, $results['processed'], $results['categorized'], $results['skipped']);
-                    }
-                }
-            });
-
-            Log::info("ProcessAllProducts completed. Processed: {$results['processed']}, Categorized: {$results['categorized']}, Skipped: {$results['skipped']}, Errors: {$results['errors']}");
+            Log::info("ProcessAllProducts completed successfully. Processed: {$results['processed']}, Categorized: {$results['categorized']}, Skipped: {$results['skipped']}, Errors: {$results['errors']}");
 
         } catch (Exception $e) {
             Log::error('Error in processAllProducts: ' . $e->getMessage());
@@ -767,15 +921,20 @@ private function productHasCategory(Product $product): bool
         return $results;
     }
 
-
-    public function hasExistingCategory(Product $product): bool
+    /**
+     * متد جایگزین برای بررسی سریع‌تر وجود دسته‌بندی
+     */
+    private function productHasCategoryFast(int $productId): bool
     {
-        $categoryCount = DB::table('catables')
-            ->where('catables_id', $product->id)
-            ->where('catables_type', Product::class)
-            ->count();
-
-        return $categoryCount > 0;
+        try {
+            return DB::table('catables')
+                ->where('catables_id', $productId)
+                ->where('catables_type', Product::class)
+                ->exists();
+        } catch (Exception $e) {
+            Log::error("Fast category check failed for product {$productId}: " . $e->getMessage());
+            return true; // در صورت شک، فرض کنیم دسته‌بندی دارد
+        }
     }
 
     /**
