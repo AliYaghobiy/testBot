@@ -20,11 +20,11 @@ class ProductCategorizationBot
             $this->client = ClientBuilder::create()
                 ->setHosts(['localhost:9200'])
                 ->build();
-                
+
             // تست اتصال
             $response = $this->client->info();
             Log::info('Connected to Elasticsearch: ' . $response['version']['number']);
-            
+
         } catch (Exception $e) {
             Log::error('Failed to connect to Elasticsearch: ' . $e->getMessage());
             throw new Exception('Elasticsearch connection failed: ' . $e->getMessage());
@@ -185,14 +185,14 @@ class ProductCategorizationBot
     {
         $words = explode(' ', $text);
         $mainWords = [];
-        
+
         foreach ($words as $word) {
             $word = trim($word);
             if (mb_strlen($word) > 2) {
                 $mainWords[] = $word;
             }
         }
-        
+
         return $mainWords[0] ?? '';
     }
 
@@ -212,16 +212,16 @@ class ProductCategorizationBot
             $score = $hit['_score'];
             $categoryName = $hit['_source']['category_name'];
             $categoryKeywords = $hit['_source']['category_keywords'] ?? '';
-            
+
             // بررسی تطابق مستقیم
             $directMatch = $this->calculateDirectMatch($searchText, $categoryName, $titleKeywords);
-            
+
             // بررسی تطابق کلمات کلیدی
             $keywordMatch = $this->calculateKeywordMatch($titleKeywords, $categoryKeywords);
-            
+
             // محاسبه امتیاز نهایی با ضرایب متعادل‌تر
             $finalScore = $score + ($directMatch * 10) + ($keywordMatch * 5);
-            
+
             if ($finalScore > $bestScore) {
                 $bestScore = $finalScore;
                 $bestMatch = $hit;
@@ -238,23 +238,23 @@ class ProductCategorizationBot
     private function calculateDirectMatch(string $searchText, string $categoryName, array $titleKeywords): float
     {
         $matchScore = 0;
-        
+
         // تطابق دقیق نام دسته‌بندی
         if (stripos($searchText, $categoryName) !== false || stripos($categoryName, $searchText) !== false) {
             $matchScore += 5;
         }
-        
+
         // تطابق کلمات کلیدی عنوان
         foreach ($titleKeywords as $keyword) {
             if (stripos($categoryName, $keyword) !== false) {
                 $matchScore += 2;
             }
         }
-        
+
         // تطابق طول نام
         $lengthSimilarity = 1 - abs(mb_strlen($searchText) - mb_strlen($categoryName)) / max(mb_strlen($searchText), mb_strlen($categoryName));
         $matchScore += $lengthSimilarity;
-        
+
         return $matchScore;
     }
 
@@ -264,10 +264,10 @@ class ProductCategorizationBot
     private function calculateKeywordMatch(array $titleKeywords, string $categoryKeywords): float
     {
         if (empty($categoryKeywords)) return 0;
-        
+
         $categoryKeywordArray = explode(' ', $categoryKeywords);
         $matchCount = 0;
-        
+
         foreach ($titleKeywords as $titleKeyword) {
             foreach ($categoryKeywordArray as $catKeyword) {
                 if (stripos($catKeyword, $titleKeyword) !== false || stripos($titleKeyword, $catKeyword) !== false) {
@@ -276,7 +276,7 @@ class ProductCategorizationBot
                 }
             }
         }
-        
+
         return $matchCount / max(count($titleKeywords), 1);
     }
 
@@ -286,23 +286,23 @@ class ProductCategorizationBot
     private function extractKeywords(string $text): array
     {
         if (empty($text)) return [];
-        
+
         $text = strip_tags($text);
         $text = preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $text);
         $text = preg_replace('/\s+/', ' ', $text);
-        
+
         $words = explode(' ', trim($text));
-        
+
         $stopWords = ['و', 'در', 'با', 'به', 'از', 'که', 'این', 'آن', 'را', 'تا', 'برای'];
         $keywords = [];
-        
+
         foreach ($words as $word) {
             $word = trim($word);
             if (mb_strlen($word) > 2 && !in_array($word, $stopWords)) {
                 $keywords[] = $word;
             }
         }
-        
+
         return array_slice($keywords, 0, 10);
     }
 
@@ -321,29 +321,29 @@ class ProductCategorizationBot
     private function prepareSearchText(Product $product): string
     {
         $searchParts = [];
-        
+
         if ($product->title) {
             $searchParts[] = $product->title;
         }
-        
+
         if ($product->keyword) {
             $searchParts[] = $product->keyword;
         }
-        
+
         if ($product->titleSeo) {
             $searchParts[] = $product->titleSeo;
         }
-        
+
         if ($product->body) {
             $bodyText = strip_tags($product->body);
             $bodyWords = explode(' ', $bodyText);
             $importantWords = array_slice($bodyWords, 0, 15);
             $searchParts[] = implode(' ', $importantWords);
         }
-        
+
         $searchText = implode(' ', array_filter($searchParts));
         $searchText = $this->normalizeText($searchText);
-        
+
         return trim($searchText);
     }
 
@@ -355,13 +355,13 @@ class ProductCategorizationBot
         $text = strip_tags($text);
         $text = preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $text);
         $text = preg_replace('/\s+/', ' ', $text);
-        
+
         $englishNumbers = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
         $persianNumbers = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹'];
         $text = str_replace($englishNumbers, $persianNumbers, $text);
-        
+
         $text = str_replace(['ك', 'ي'], ['ک', 'ی'], $text);
-        
+
         return $text;
     }
 
@@ -371,15 +371,38 @@ class ProductCategorizationBot
     public function assignCategoryToProduct(Product $product, Category $category): void
     {
         try {
+            // حذف دسته‌بندی‌های قبلی محصول
             $product->catables()->delete();
 
+            // دریافت تمام دسته‌های مادر
+            $parentCategories = $category->getAllParentCategories();
+
+            // اختصاص دسته اصلی
             $product->catables()->create([
                 'category_id' => $category->id,
                 'catables_id' => $product->id,
                 'catables_type' => Product::class
             ]);
 
-            Log::info("Product {$product->id} assigned to category {$category->id}");
+            // اختصاص دسته‌های مادر
+            foreach ($parentCategories as $parentCategory) {
+                // بررسی اینکه این دسته قبلاً اختصاص داده نشده باشد
+                $exists = $product->catables()
+                    ->where('category_id', $parentCategory['id'])
+                    ->exists();
+
+                if (!$exists) {
+                    $product->catables()->create([
+                        'category_id' => $parentCategory['id'],
+                        'catables_id' => $product->id,
+                        'catables_type' => Product::class
+                    ]);
+                }
+            }
+
+            $totalAssigned = 1 + count($parentCategories);
+            Log::info("Product {$product->id} assigned to category {$category->id} and {$totalAssigned} total categories (including parents)");
+
         } catch (Exception $e) {
             Log::error("Error assigning category to product {$product->id}: " . $e->getMessage());
             throw $e;
@@ -518,7 +541,7 @@ class ProductCategorizationBot
             $indexedCount = 0;
             foreach ($categories as $category) {
                 $enrichedKeywords = $this->enrichCategoryKeywords($category);
-                
+
                 $body = [
                     'category_id' => $category->id,
                     'category_name' => $category->name ?? '',
@@ -551,22 +574,22 @@ class ProductCategorizationBot
     private function enrichCategoryKeywords(Category $category): string
     {
         $keywords = [];
-        
+
         if ($category->keyword) {
             $keywords[] = $category->keyword;
         }
-        
+
         $nameWords = explode(' ', $category->name ?? '');
         $keywords = array_merge($keywords, $nameWords);
-        
+
         $synonyms = $this->getCategorySynonyms($category->name ?? '');
         $keywords = array_merge($keywords, $synonyms);
-        
+
         $keywords = array_unique($keywords);
         $keywords = array_filter($keywords, function($word) {
             return mb_strlen(trim($word)) > 1;
         });
-        
+
         return implode(' ', $keywords);
     }
 
@@ -589,14 +612,14 @@ class ProductCategorizationBot
             'انگشتر' => ['ring', 'حلقه', 'jewelry'],
             'گردنبند' => ['necklace', 'زنجیر', 'jewelry']
         ];
-        
+
         $synonyms = [];
         foreach ($synonymMap as $word => $wordSynonyms) {
             if (stripos($categoryName, $word) !== false) {
                 $synonyms = array_merge($synonyms, $wordSynonyms);
             }
         }
-        
+
         return $synonyms;
     }
 
@@ -606,19 +629,19 @@ class ProductCategorizationBot
     private function prepareCategoryDescription(Category $category): string
     {
         $description = [];
-        
+
         if ($category->nameSeo) {
             $description[] = $category->nameSeo;
         }
-        
+
         if ($category->bodySeo) {
             $description[] = strip_tags($category->bodySeo);
         }
-        
+
         if ($category->body) {
             $description[] = strip_tags($category->body);
         }
-        
+
         return implode(' ', $description);
     }
 
@@ -642,9 +665,9 @@ class ProductCategorizationBot
                 foreach ($products as $product) {
                     try {
                         $results['processed']++;
-                        
+
                         $categoryResult = $this->findBestCategoryWithScore($product);
-                        
+
                         if ($categoryResult) {
                             $this->assignCategoryToProduct($product, $categoryResult['category']);
                             $results['categorized']++;
@@ -685,7 +708,7 @@ class ProductCategorizationBot
         try {
             $indexExistsResponse = $this->client->indices()->exists(['index' => $this->index]);
             $indexExists = $indexExistsResponse->getStatusCode() === 200;
-            
+
             if (!$indexExists) {
                 return ['exists' => false];
             }

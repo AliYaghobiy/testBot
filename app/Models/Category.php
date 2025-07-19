@@ -22,5 +22,63 @@ class Category extends Model
         return $this->hasManyThrough(Product::class, Catable::class, 'category_id', 'id', 'id', 'catables_id')
             ->where('catables_type', Product::class);
     }
-}
 
+    /**
+     * دریافت دسته‌های مادر از جدول catables
+     */
+    public function getParentCategories(): array
+    {
+        $parentIds = \DB::table('catables')
+            ->where('catables_id', $this->id)
+            ->where('catables_type', Category::class)
+            ->pluck('category_id')
+            ->toArray();
+
+        return Category::whereIn('id', $parentIds)->get()->toArray();
+    }
+
+    /**
+     * دریافت تمام دسته‌های مادر به صورت بازگشتی
+     */
+    public function getAllParentCategories(): array
+    {
+        $allParents = [];
+        $currentParents = $this->getParentCategories();
+
+        foreach ($currentParents as $parent) {
+            $allParents[] = $parent;
+            $parentCategory = Category::find($parent['id']);
+            if ($parentCategory) {
+                $grandParents = $parentCategory->getAllParentCategories();
+                $allParents = array_merge($allParents, $grandParents);
+            }
+        }
+
+        // حذف دسته‌های تکراری
+        $uniqueParents = [];
+        $seenIds = [];
+
+        foreach ($allParents as $parent) {
+            if (!in_array($parent['id'], $seenIds)) {
+                $uniqueParents[] = $parent;
+                $seenIds[] = $parent['id'];
+            }
+        }
+
+        return $uniqueParents;
+    }
+
+    /**
+     * دریافت کل مسیر سلسله مراتبی دسته‌بندی
+     */
+    public function getCategoryPath(): array
+    {
+        $path = [$this->toArray()];
+        $parents = $this->getAllParentCategories();
+
+        // مرتب کردن والدها از کلی به خاص
+        $parents = array_reverse($parents);
+
+        return array_merge($parents, $path);
+    }
+}

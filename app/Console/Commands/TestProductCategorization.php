@@ -42,7 +42,7 @@ class TestProductCategorization extends Command
         $successCount = 0;
 
         // ایجاد جدول نتایج
-        $headers = ['ID', 'Product Title', 'Search Text Preview', 'Suggested Category', 'Score', 'Status'];
+        $headers = ['ID', 'Product Title', 'Search Text Preview', 'Suggested Category', 'Parent Categories', 'Score', 'Status'];
         $tableData = [];
 
         foreach ($products as $product) {
@@ -55,22 +55,39 @@ class TestProductCategorization extends Command
                     $category = $categoryResult['category'];
                     $score = $categoryResult['score'];
 
+                    // دریافت دسته‌های مادر
+                    $parentCategories = $category->getAllParentCategories();
+                    $parentNames = array_map(function($cat) {
+                        return $cat['name'];
+                    }, $parentCategories);
+
+                    // ایجاد مسیر کامل
+                    $fullPath = array_merge($parentNames, [$category->name]);
+                    $pathString = implode(' / ', $fullPath);
+
                     $tableData[] = [
                         $product->id,
-                        $this->truncateString($product->title, 30),
-                        $this->truncateString($searchText, 25),
+                        $this->truncateString($product->title, 25),
+                        $this->truncateString($searchText, 20),
                         $category->name,
+                        count($parentNames) > 0 ? implode(', ', array_slice($parentNames, 0, 2)) . (count($parentNames) > 2 ? '...' : '') : 'None',
                         number_format($score, 2),
                         '✅ Success'
                     ];
+
+                    if ($showDetails) {
+                        $this->info("Full Category Path: {$pathString}");
+                        $this->info("Total Categories (including parents): " . (count($parentCategories) + 1));
+                    }
 
                     $successCount++;
                 } else {
                     $tableData[] = [
                         $product->id,
-                        $this->truncateString($product->title, 30),
-                        $this->truncateString($searchText, 25),
+                        $this->truncateString($product->title, 25),
+                        $this->truncateString($searchText, 20),
                         'No match found',
+                        'N/A',
                         '0.00',
                         '❌ Failed'
                     ];
@@ -83,9 +100,10 @@ class TestProductCategorization extends Command
             } catch (\Exception $e) {
                 $tableData[] = [
                     $product->id,
-                    $this->truncateString($product->title, 30),
+                    $this->truncateString($product->title, 25),
                     'Error',
                     'Error occurred',
+                    'N/A',
                     '0.00',
                     '⚠️ Error'
                 ];
@@ -93,7 +111,6 @@ class TestProductCategorization extends Command
                 $this->error("Error processing product {$product->id}: " . $e->getMessage());
             }
         }
-
         // نمایش جدول نتایج
         $this->table($headers, $tableData);
 
@@ -167,14 +184,14 @@ class TestProductCategorization extends Command
         $this->info("Title: {$product->title}");
         $this->info("Keywords: " . ($product->keyword ?? 'N/A'));
         $this->info("Search Text: " . $this->prepareSearchText($product));
-        
+
         if ($categoryResult) {
             $this->info("✅ Matched Category: {$categoryResult['category']->name}");
             $this->info("Score: {$categoryResult['score']}");
         } else {
             $this->warn("❌ No match found");
         }
-        
+
         $this->newLine();
     }
 
@@ -193,7 +210,7 @@ class TestProductCategorization extends Command
         $searchText = implode(' ', array_filter($searchParts));
         $searchText = strip_tags($searchText);
         $searchText = preg_replace('/\s+/', ' ', $searchText);
-        
+
         return trim($searchText);
     }
 
@@ -217,7 +234,7 @@ class TestProductCategorization extends Command
                     $bot->assignCategoryToProduct($product, $categoryResult['category']);
                     $applied++;
                 }
-                
+
                 $bar->advance();
             }
 
