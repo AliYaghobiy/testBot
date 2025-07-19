@@ -652,11 +652,25 @@ class ProductCategorizationBot
     /**
      * پردازش تمام محصولات - نسخه کاملاً اصلاح شده
      */
+
+
+     /**
+ * بررسی اینکه آیا محصول از قبل دسته‌بندی دارد یا نه
+ */
+private function productHasCategory(Product $product): bool
+{
+    return DB::table('catables')
+              ->where('catables_id', $product->id)
+              ->where('catables_type', Product::class)
+              ->exists();
+}
+
     public function processAllProducts(callable $progressCallback = null): array
     {
         $results = [
             'processed' => 0,
             'categorized' => 0,
+            'skipped' => 0,
             'errors' => 0
         ];
 
@@ -671,17 +685,28 @@ class ProductCategorizationBot
 
             Product::orderBy('id')->chunk(1, function ($products) use (&$results, $progressCallback) {
                 $product = $products->first();
-                
+
                 try {
                     $results['processed']++;
-                    
+
+                    // بررسی اینکه آیا محصول از قبل دسته‌بندی دارد یا نه
+                    if ($this->hasExistingCategory($product)) {
+                        $results['skipped']++;
+                        Log::warning("❌ Product {$product->id} already has category assignment - SKIPPED");
+
+                        if ($progressCallback) {
+                            $progressCallback($product->id, ['already_categorized' => true], $results['processed'], $results['categorized'], $results['skipped']);
+                        }
+                        return;
+                    }
+
                     // آماده‌سازی متن جستجو برای debug
                     $searchText = $this->prepareSearchText($product);
-                    
+
                     if (empty(trim($searchText))) {
                         Log::warning("Empty search text for product {$product->id}");
                         if ($progressCallback) {
-                            $progressCallback($product->id, null, $results['processed'], $results['categorized']);
+                            $progressCallback($product->id, null, $results['processed'], $results['categorized'], $results['skipped']);
                         }
                         return;
                     }
@@ -694,27 +719,27 @@ class ProductCategorizationBot
                             // اختصاص دسته‌بندی به محصول
                             $this->assignCategoryToProduct($product, $categoryResult['category']);
                             $results['categorized']++;
-                            
+
                             Log::info("✅ Product {$product->id} successfully categorized to {$categoryResult['category']->name} with score {$categoryResult['score']}");
-                            
+
                             // فراخوانی callback برای نمایش موفقیت
                             if ($progressCallback) {
-                                $progressCallback($product->id, $categoryResult, $results['processed'], $results['categorized']);
+                                $progressCallback($product->id, $categoryResult, $results['processed'], $results['categorized'], $results['skipped']);
                             }
-                            
+
                         } catch (Exception $assignError) {
                             $results['errors']++;
                             Log::error("❌ Error assigning category to product {$product->id}: " . $assignError->getMessage());
-                            
+
                             if ($progressCallback) {
-                                $progressCallback($product->id, null, $results['processed'], $results['categorized']);
+                                $progressCallback($product->id, null, $results['processed'], $results['categorized'], $results['skipped']);
                             }
                         }
                     } else {
                         Log::info("❌ No category found for product {$product->id} with search text: {$searchText}");
-                        
+
                         if ($progressCallback) {
-                            $progressCallback($product->id, null, $results['processed'], $results['categorized']);
+                            $progressCallback($product->id, null, $results['processed'], $results['categorized'], $results['skipped']);
                         }
                     }
 
@@ -727,12 +752,12 @@ class ProductCategorizationBot
 
                     // فراخوانی callback برای نمایش خطا
                     if ($progressCallback) {
-                        $progressCallback($product->id, null, $results['processed'], $results['categorized']);
+                        $progressCallback($product->id, null, $results['processed'], $results['categorized'], $results['skipped']);
                     }
                 }
             });
 
-            Log::info("ProcessAllProducts completed. Processed: {$results['processed']}, Categorized: {$results['categorized']}, Errors: {$results['errors']}");
+            Log::info("ProcessAllProducts completed. Processed: {$results['processed']}, Categorized: {$results['categorized']}, Skipped: {$results['skipped']}, Errors: {$results['errors']}");
 
         } catch (Exception $e) {
             Log::error('Error in processAllProducts: ' . $e->getMessage());
@@ -742,22 +767,33 @@ class ProductCategorizationBot
         return $results;
     }
 
+
+    public function hasExistingCategory(Product $product): bool
+    {
+        $categoryCount = DB::table('catables')
+            ->where('catables_id', $product->id)
+            ->where('catables_type', Product::class)
+            ->count();
+
+        return $categoryCount > 0;
+    }
+
     /**
      * تست یک محصول خاص برای debugging
      */
     public function testSingleProduct(int $productId): array
     {
         $product = Product::find($productId);
-        
+
         if (!$product) {
             return ['error' => 'Product not found'];
         }
 
         $searchText = $this->prepareSearchText($product);
         Log::info("Testing product {$productId} with search text: {$searchText}");
-        
+
         $categoryResult = $this->findBestCategoryWithScore($product);
-        
+
         if ($categoryResult) {
             Log::info("Found category for product {$productId}: {$categoryResult['category']->name} with score {$categoryResult['score']}");
             return [
